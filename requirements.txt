@@ -1,6 +1,5 @@
 streamlit>=1.36
 openai>=1.40
-crewai>=0.70
 opencv-python-headless>=4.10
 mediapipe>=0.10.14,<0.10.30
 pandas>=2.2
@@ -9,6 +8,11 @@ matplotlib>=3.8
 plotly>=5.22
 pillow>=10.4
 sqlalchemy>=2.0
+
+# crewai is optional — the app falls back gracefully when it is absent.
+# Install locally with: pip install crewai>=0.70
+# It is excluded here because its 100+ transitive dependencies cause
+# dependency conflicts on Streamlit Cloud.
 
 # Optional local/advanced analyzers. Install manually when your deployment
 # environment supports their native dependencies:
