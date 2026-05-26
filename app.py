@@ -177,13 +177,19 @@ def source_selector():
         st.warning("Consent is required before scanning.")
         return None
 
-    tab_camera, tab_upload = st.tabs(["Webcam Capture", "Image Upload"])
+    tab_upload, tab_camera = st.tabs(["Photo Upload", "Webcam Capture"])
+    with tab_upload:
+        st.caption("Take a photo with your phone or camera, then upload it here.")
+        uploaded_file = st.file_uploader("Upload JPG, JPEG, or PNG", type=["jpg", "jpeg", "png"])
+        if uploaded_file:
+            valid, message = validate_image_file(uploaded_file)
+            if not valid:
+                st.error(message)
+                return None
+            st.success("Photo uploaded. Running analysis now.")
+            return uploaded_file
     with tab_camera:
         st.caption("Use even lighting, center your face, and keep the camera near eye level.")
-        st.info(
-            "If the camera preview does not open, allow camera permission for this browser tab. "
-            "If capture works but no face is detected, retake with your full face centered and looking forward."
-        )
         if st.button("Start 3-second readiness countdown", use_container_width=True):
             placeholder = st.empty()
             for remaining in [3, 2, 1]:
@@ -192,16 +198,8 @@ def source_selector():
             placeholder.success("Capture when ready.")
         camera_file = st.camera_input("Capture a clear face image", label_visibility="collapsed")
         if camera_file:
-            st.success("Webcam image captured. Running face detection now.")
+            st.success("Webcam image captured. Running analysis now.")
             return camera_file
-    with tab_upload:
-        uploaded_file = st.file_uploader("Upload JPG, JPEG, or PNG", type=["jpg", "jpeg", "png"])
-        if uploaded_file:
-            valid, message = validate_image_file(uploaded_file)
-            if not valid:
-                st.error(message)
-                return None
-            return uploaded_file
     return None
 
 

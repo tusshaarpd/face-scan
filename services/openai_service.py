@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
-import subprocess
-import requests
 from PIL import Image
 
 from utils.image_utils import image_to_base64_jpeg
@@ -69,48 +69,75 @@ def get_model() -> str:
 
 
 def _call_openai(api_key: str, model: str, messages: list) -> str:
-    """Call OpenAI via curl.exe subprocess.
+    """Call OpenAI via PowerShell Invoke-RestMethod (Windows HTTP stack / WinHTTP).
 
-    Windows Firewall blocks Python's socket on port 443 (WinError 10013).
-    curl.exe is a Windows system binary that always has outbound network
-    permission, so it bypasses the restriction entirely.
+    Python sockets and curl are blocked by Windows Firewall in Streamlit's
+    process context (WinError 10013 / curl exit 7). PowerShell's WinHTTP
+    backend is always allowed and bypasses those restrictions.
     """
-    payload = json.dumps({
+    payload_str = json.dumps({
         "model": model,
         "messages": messages,
         "response_format": {"type": "json_object"},
         "max_tokens": 1024,
     })
 
-    result = subprocess.run(
-        [
-            "curl.exe", "-s",
-            "-X", "POST", OPENAI_CHAT_URL,
-            "-H", f"Authorization: Bearer {api_key}",
-            "-H", "Content-Type: application/json",
-            "-d", "@-",
-        ],
-        input=payload,
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
+    # Write JSON payload to a temp file — avoids PowerShell command-line length limits
+    fd, tmp_path = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload_str)
 
-    if result.returncode != 0:
-        raise RuntimeError(f"curl failed (exit {result.returncode}): {result.stderr}")
+        # Forward-slash path for PowerShell compatibility
+        ps_path = tmp_path.replace("\\", "/")
 
-    data = json.loads(result.stdout)
-    if "error" in data:
-        err = data["error"]
-        code = err.get("code", "")
-        status = err.get("status", 0)
-        if code == "invalid_api_key" or status == 401:
-            raise requests.HTTPError(response=type("R", (), {"status_code": 401, "text": err["message"]})())
-        if status == 429 or "rate" in err.get("message", "").lower() or "quota" in err.get("message", "").lower():
-            raise requests.HTTPError(response=type("R", (), {"status_code": 429, "text": err["message"]})())
-        raise RuntimeError(err.get("message", str(err)))
+        ps_script = f"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$body = [System.IO.File]::ReadAllText('{ps_path}')
+$headers = @{{
+    'Authorization' = 'Bearer {api_key}'
+    'Content-Type'  = 'application/json'
+}}
+try {{
+    $r = Invoke-RestMethod -Uri '{OPENAI_CHAT_URL}' -Method POST -Headers $headers -Body $body -ContentType 'application/json'
+    $r.choices[0].message.content
+}} catch {{
+    $msg = $_.Exception.Message
+    Write-Error $msg
+    exit 1
+}}
+"""
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NonInteractive", "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command", ps_script,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=120,
+        )
 
-    return data["choices"][0]["message"]["content"]
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout).strip()
+            if "401" in err or "Incorrect API key" in err or "invalid_api_key" in err:
+                raise PermissionError("Invalid API key — check platform.openai.com/api-keys.")
+            if "429" in err or "quota" in err.lower() or "rate" in err.lower():
+                raise RuntimeError("Rate limit or quota exceeded — check platform.openai.com/usage.")
+            raise RuntimeError(f"PowerShell HTTP call failed: {err[:300]}")
+
+        content = result.stdout.strip()
+        if not content:
+            raise RuntimeError("Empty response from OpenAI.")
+        return content
+
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 
 def _sanitize_report(data: dict[str, Any]) -> dict[str, Any]:
@@ -170,26 +197,28 @@ def analyze_with_openai(
             if observations.get(k) is not None
         }
 
-        system_prompt = (
-            "You are a wellness assistant interpreting facial visual cues from a live photo. "
-            "You provide indicative wellness observations only — never medical diagnoses. "
-            "Use the CV measurements and image together. "
-            "Keep recommendations supportive, practical, and non-medical.\n\n"
-            + SCHEMA_PROMPT
-        )
-
-        user_text = (
-            "Analyse this facial photo for non-medical wellness indicators.\n"
-            f"CV observations: {json.dumps(cv_summary, default=str)}\n"
-            "Return ONLY the JSON object described in the system prompt."
-        )
-
         messages = [
-            {"role": "system", "content": system_prompt},
+            {
+                "role": "system",
+                "content": (
+                    "You are a wellness assistant interpreting facial visual cues. "
+                    "Provide indicative wellness observations only — never medical diagnoses. "
+                    "Use the CV measurements and the photo together. "
+                    "Keep recommendations supportive and non-medical.\n\n"
+                    + SCHEMA_PROMPT
+                ),
+            },
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": user_text},
+                    {
+                        "type": "text",
+                        "text": (
+                            "Analyse this facial photo for non-medical wellness indicators. "
+                            f"CV observations: {json.dumps(cv_summary, default=str)}. "
+                            "Return ONLY the JSON object described in the system prompt."
+                        ),
+                    },
                     {
                         "type": "image_url",
                         "image_url": {
@@ -205,16 +234,7 @@ def analyze_with_openai(
         data = _parse_json_response(raw)
         return {"status": "ok", "data": _sanitize_report(data)}
 
-    except requests.HTTPError as exc:
-        code = exc.response.status_code
-        if code == 401:
-            msg = "Invalid API key — verify at platform.openai.com/api-keys."
-        elif code == 403:
-            msg = "Key lacks permission for this model. Try gpt-4.1-mini."
-        elif code == 429:
-            msg = "Rate limit or quota exceeded — check platform.openai.com/usage."
-        else:
-            msg = f"OpenAI HTTP {code}: {exc.response.text[:200]}"
-        return {"status": "error", "message": msg}
+    except PermissionError as exc:
+        return {"status": "error", "message": str(exc)}
     except Exception as exc:
         return {"status": "error", "message": f"OpenAI error: {exc}"}
