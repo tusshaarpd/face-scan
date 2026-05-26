@@ -5,8 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-import certifi
-import httpx
+import requests
 from PIL import Image
 
 from utils.image_utils import image_to_base64_jpeg
@@ -69,8 +68,8 @@ def get_model() -> str:
 
 
 def _call_openai(api_key: str, model: str, messages: list) -> str:
-    """Direct httpx POST to OpenAI — bypasses SDK to avoid client config issues."""
-    response = httpx.post(
+    """Direct requests POST to OpenAI — thread-safe, no async conflicts with Streamlit."""
+    response = requests.post(
         OPENAI_CHAT_URL,
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -83,7 +82,6 @@ def _call_openai(api_key: str, model: str, messages: list) -> str:
             "max_tokens": 1024,
         },
         timeout=60,
-        verify=certifi.where(),
     )
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
@@ -181,7 +179,7 @@ def analyze_with_openai(
         data = _parse_json_response(raw)
         return {"status": "ok", "data": _sanitize_report(data)}
 
-    except httpx.HTTPStatusError as exc:
+    except requests.HTTPError as exc:
         code = exc.response.status_code
         if code == 401:
             msg = "Invalid API key — verify at platform.openai.com/api-keys."
