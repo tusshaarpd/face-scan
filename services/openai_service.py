@@ -69,11 +69,12 @@ def get_model() -> str:
 
 
 def _call_openai(api_key: str, model: str, messages: list) -> str:
-    """Call OpenAI via PowerShell Invoke-RestMethod (Windows HTTP stack / WinHTTP).
+    """Call OpenAI via a PowerShell .ps1 script (Windows WinHTTP stack).
 
-    Python sockets and curl are blocked by Windows Firewall in Streamlit's
-    process context (WinError 10013 / curl exit 7). PowerShell's WinHTTP
-    backend is always allowed and bypasses those restrictions.
+    Python sockets (WinError 10013) and curl (exit 7) are blocked inside
+    Streamlit's process context. PowerShell's Invoke-RestMethod uses the
+    Windows HTTP stack and is always permitted.
+    Script is written to a .ps1 file so multi-line execution is reliable.
     """
     payload_str = json.dumps({
         "model": model,
@@ -82,37 +83,44 @@ def _call_openai(api_key: str, model: str, messages: list) -> str:
         "max_tokens": 1024,
     })
 
-    # Write JSON payload to a temp file — avoids PowerShell command-line length limits
-    fd, tmp_path = tempfile.mkstemp(suffix=".json")
+    fd_json, json_path = tempfile.mkstemp(suffix=".json")
+    fd_ps,   ps1_path  = tempfile.mkstemp(suffix=".ps1")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        # Write JSON payload
+        with os.fdopen(fd_json, "w", encoding="utf-8") as f:
             f.write(payload_str)
 
-        # Forward-slash path for PowerShell compatibility
-        ps_path = tmp_path.replace("\\", "/")
+        # Escape backslashes for PowerShell string literals
+        safe_json = json_path.replace("\\", "\\\\")
+        safe_key  = api_key.replace("'", "''")   # escape single quotes
 
-        ps_script = f"""
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$body = [System.IO.File]::ReadAllText('{ps_path}')
-$headers = @{{
-    'Authorization' = 'Bearer {api_key}'
-    'Content-Type'  = 'application/json'
-}}
-try {{
-    $r = Invoke-RestMethod -Uri '{OPENAI_CHAT_URL}' -Method POST -Headers $headers -Body $body -ContentType 'application/json'
-    $r.choices[0].message.content
-}} catch {{
-    $msg = $_.Exception.Message
-    Write-Error $msg
-    exit 1
-}}
-"""
+        ps_script = (
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+            f"$body = [System.IO.File]::ReadAllText('{safe_json}')\n"
+            "$headers = New-Object 'System.Collections.Generic.Dictionary[[String],[String]]'\n"
+            f"$headers.Add('Authorization', 'Bearer {safe_key}')\n"
+            "$headers.Add('Content-Type', 'application/json')\n"
+            "try {\n"
+            f"    $r = Invoke-RestMethod -Uri '{OPENAI_CHAT_URL}' "
+            "-Method POST -Headers $headers -Body $body -ContentType 'application/json'\n"
+            "    $r.choices[0].message.content\n"
+            "} catch {\n"
+            "    $code = $_.Exception.Response.StatusCode.value__\n"
+            "    $msg  = $_.Exception.Message\n"
+            "    Write-Output (\"OPENAI_ERROR:\" + $code + \":\" + $msg)\n"
+            "    exit 1\n"
+            "}\n"
+        )
+
+        with os.fdopen(fd_ps, "w", encoding="utf-8") as f:
+            f.write(ps_script)
+
         result = subprocess.run(
             [
                 "powershell.exe",
                 "-NonInteractive", "-NoProfile",
                 "-ExecutionPolicy", "Bypass",
-                "-Command", ps_script,
+                "-File", ps1_path,
             ],
             capture_output=True,
             text=True,
@@ -120,24 +128,34 @@ try {{
             timeout=120,
         )
 
-        if result.returncode != 0:
-            err = (result.stderr or result.stdout).strip()
-            if "401" in err or "Incorrect API key" in err or "invalid_api_key" in err:
-                raise PermissionError("Invalid API key — check platform.openai.com/api-keys.")
-            if "429" in err or "quota" in err.lower() or "rate" in err.lower():
-                raise RuntimeError("Rate limit or quota exceeded — check platform.openai.com/usage.")
-            raise RuntimeError(f"PowerShell HTTP call failed: {err[:300]}")
+        stdout = result.stdout.strip()
 
-        content = result.stdout.strip()
-        if not content:
+        # Errors written to stdout as OPENAI_ERROR:code:msg
+        if stdout.startswith("OPENAI_ERROR:"):
+            parts = stdout.split(":", 2)
+            code = parts[1] if len(parts) > 1 else ""
+            msg  = parts[2] if len(parts) > 2 else stdout
+            if code == "401" or "Unauthorized" in msg:
+                raise PermissionError("Invalid API key — verify at platform.openai.com/api-keys.")
+            if code == "429" or "quota" in msg.lower() or "rate" in msg.lower():
+                raise RuntimeError("Rate limit or quota exceeded — check platform.openai.com/usage.")
+            raise RuntimeError(f"OpenAI {code}: {msg[:200]}")
+
+        if result.returncode != 0:
+            err = (stdout or result.stderr.strip())[:300]
+            raise RuntimeError(f"PowerShell script failed: {err}")
+
+        if not stdout:
             raise RuntimeError("Empty response from OpenAI.")
-        return content
+
+        return stdout
 
     finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        for p in (json_path, ps1_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
 
 def _sanitize_report(data: dict[str, Any]) -> dict[str, Any]:
