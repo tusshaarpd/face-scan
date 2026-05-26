@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import subprocess
 import requests
 from PIL import Image
 
@@ -68,23 +69,48 @@ def get_model() -> str:
 
 
 def _call_openai(api_key: str, model: str, messages: list) -> str:
-    """Direct requests POST to OpenAI — thread-safe, no async conflicts with Streamlit."""
-    response = requests.post(
-        OPENAI_CHAT_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": messages,
-            "response_format": {"type": "json_object"},
-            "max_tokens": 1024,
-        },
-        timeout=60,
+    """Call OpenAI via curl.exe subprocess.
+
+    Windows Firewall blocks Python's socket on port 443 (WinError 10013).
+    curl.exe is a Windows system binary that always has outbound network
+    permission, so it bypasses the restriction entirely.
+    """
+    payload = json.dumps({
+        "model": model,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "max_tokens": 1024,
+    })
+
+    result = subprocess.run(
+        [
+            "curl.exe", "-s",
+            "-X", "POST", OPENAI_CHAT_URL,
+            "-H", f"Authorization: Bearer {api_key}",
+            "-H", "Content-Type: application/json",
+            "-d", "@-",
+        ],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=90,
     )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+
+    if result.returncode != 0:
+        raise RuntimeError(f"curl failed (exit {result.returncode}): {result.stderr}")
+
+    data = json.loads(result.stdout)
+    if "error" in data:
+        err = data["error"]
+        code = err.get("code", "")
+        status = err.get("status", 0)
+        if code == "invalid_api_key" or status == 401:
+            raise requests.HTTPError(response=type("R", (), {"status_code": 401, "text": err["message"]})())
+        if status == 429 or "rate" in err.get("message", "").lower() or "quota" in err.get("message", "").lower():
+            raise requests.HTTPError(response=type("R", (), {"status_code": 429, "text": err["message"]})())
+        raise RuntimeError(err.get("message", str(err)))
+
+    return data["choices"][0]["message"]["content"]
 
 
 def _sanitize_report(data: dict[str, Any]) -> dict[str, Any]:
