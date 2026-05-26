@@ -1,7 +1,7 @@
 streamlit>=1.36
 openai>=1.40
 opencv-python-headless>=4.10
-mediapipe>=0.10.14,<0.10.30
+mediapipe>=0.10.20
 pandas>=2.2
 numpy>=1.26
 matplotlib>=3.8
