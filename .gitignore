@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.py[cod]
+.streamlit/secrets.toml
+database/*.db
+database/*.db-*
+streamlit.*.log
