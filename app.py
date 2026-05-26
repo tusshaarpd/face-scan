@@ -122,10 +122,10 @@ def sidebar() -> str:
     st.sidebar.markdown("#### AI Model")
     model_choice = st.sidebar.selectbox(
         "AI Model",
-        options=["gpt-4o-mini", "gpt-4o"],
+        options=["gpt-4.1-mini", "gpt-4.1", "gpt-4.1-nano"],
         index=0,
         label_visibility="collapsed",
-        help="gpt-4o-mini works on all API tiers (including free). gpt-4o gives richer analysis but requires a paid account.",
+        help="gpt-4.1-mini: fast and low-cost. gpt-4.1: richest analysis. gpt-4.1-nano: cheapest.",
     )
     st.session_state["openai_model"] = model_choice
 

@@ -5,15 +5,18 @@ import os
 from pathlib import Path
 from typing import Any
 
+import certifi
+import httpx
 from PIL import Image
 
 from utils.image_utils import image_to_base64_jpeg
 
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "gpt-4.1-mini"
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 
 _SCORE_KEYS = ["stress_score", "fatigue_score", "eye_strain", "recovery_score", "wellness_score"]
 
-# Load .env from project root once at import time
+
 def _load_env() -> None:
     try:
         from dotenv import load_dotenv
@@ -22,6 +25,7 @@ def _load_env() -> None:
             load_dotenv(env_path, override=False)
     except Exception:
         pass
+
 
 _load_env()
 
@@ -64,23 +68,25 @@ def get_model() -> str:
     return os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
 
 
-def _make_client(api_key: str):
-    """Build an OpenAI client with an explicit httpx transport.
-
-    Forces HTTP/1.1 and uses certifi's CA bundle — avoids SSL handshake
-    failures caused by the SDK's default httpx configuration on some
-    Windows setups.
-    """
-    import certifi
-    import httpx
-    from openai import OpenAI
-
-    http_client = httpx.Client(
-        verify=certifi.where(),
-        http2=False,
+def _call_openai(api_key: str, model: str, messages: list) -> str:
+    """Direct httpx POST to OpenAI — bypasses SDK to avoid client config issues."""
+    response = httpx.post(
+        OPENAI_CHAT_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+            "max_tokens": 1024,
+        },
         timeout=60,
+        verify=certifi.where(),
     )
-    return OpenAI(api_key=api_key, http_client=http_client)
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
 
 
 def _sanitize_report(data: dict[str, Any]) -> dict[str, Any]:
@@ -117,7 +123,7 @@ def analyze_with_openai(
     if not api_key or api_key.strip() == "sk-your-key-here":
         return {
             "status": "unavailable",
-            "message": "No OpenAI API key — paste your key in the .env file or the sidebar.",
+            "message": "No OpenAI API key — add OPENAI_API_KEY to .env or paste it in the sidebar.",
         }
     if observations.get("face_count") != 1:
         return {
@@ -126,17 +132,8 @@ def analyze_with_openai(
         }
 
     try:
-        client = _make_client(api_key)
         model = get_model()
         image_b64 = image_to_base64_jpeg(image, max_edge=512)
-
-        system_prompt = (
-            "You are a wellness assistant that interprets facial visual cues from a live photo. "
-            "You provide indicative wellness observations only — never medical diagnoses. "
-            "Use the CV measurements and image together. "
-            "Keep all recommendations supportive, practical, and non-medical.\n\n"
-            + SCHEMA_PROMPT
-        )
 
         cv_summary = {
             k: observations.get(k)
@@ -149,48 +146,51 @@ def analyze_with_openai(
             if observations.get(k) is not None
         }
 
+        system_prompt = (
+            "You are a wellness assistant interpreting facial visual cues from a live photo. "
+            "You provide indicative wellness observations only — never medical diagnoses. "
+            "Use the CV measurements and image together. "
+            "Keep recommendations supportive, practical, and non-medical.\n\n"
+            + SCHEMA_PROMPT
+        )
+
         user_text = (
             "Analyse this facial photo for non-medical wellness indicators.\n"
             f"CV observations: {json.dumps(cv_summary, default=str)}\n"
             "Return ONLY the JSON object described in the system prompt."
         )
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_b64}",
-                                "detail": "low",
-                            },
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_b64}",
+                            "detail": "low",
                         },
-                    ],
-                },
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=1024,
-        )
+                    },
+                ],
+            },
+        ]
 
-        raw = response.choices[0].message.content or "{}"
+        raw = _call_openai(api_key, model, messages)
         data = _parse_json_response(raw)
         return {"status": "ok", "data": _sanitize_report(data)}
 
-    except Exception as exc:
-        err = str(exc)
-        if "401" in err or "invalid_api_key" in err:
-            msg = "Invalid API key — check your key at platform.openai.com/api-keys."
-        elif "403" in err or "permission" in err.lower():
-            msg = "Key has no permission for this model. Try switching to gpt-4o-mini in the sidebar."
-        elif "429" in err or "quota" in err.lower() or "rate" in err.lower():
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        if code == 401:
+            msg = "Invalid API key — verify at platform.openai.com/api-keys."
+        elif code == 403:
+            msg = "Key lacks permission for this model. Try gpt-4.1-mini."
+        elif code == 429:
             msg = "Rate limit or quota exceeded — check platform.openai.com/usage."
-        elif "Connection" in err or "connect" in err.lower() or "SSL" in err:
-            msg = f"Network error reaching OpenAI: {err}"
         else:
-            msg = f"OpenAI error: {err}"
+            msg = f"OpenAI HTTP {code}: {exc.response.text[:200]}"
         return {"status": "error", "message": msg}
+    except Exception as exc:
+        return {"status": "error", "message": f"OpenAI error: {exc}"}
