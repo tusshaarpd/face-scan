@@ -8,7 +8,7 @@ from PIL import Image
 
 from utils.image_utils import image_to_base64_jpeg
 
-DEFAULT_MODEL = "gpt-4o"
+DEFAULT_MODEL = "gpt-4o-mini"
 
 REPORT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -57,6 +57,9 @@ def get_model() -> str:
     try:
         import streamlit as st
 
+        # Sidebar selector takes priority, then secrets, then env var
+        if "openai_model" in st.session_state:
+            return str(st.session_state["openai_model"])
         if "OPENAI_MODEL" in st.secrets:
             return str(st.secrets["OPENAI_MODEL"])
     except Exception:

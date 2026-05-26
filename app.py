@@ -119,6 +119,16 @@ def sidebar() -> str:
     else:
         st.sidebar.warning("No OpenAI key — Local ML analysis only")
 
+    st.sidebar.markdown("#### AI Model")
+    model_choice = st.sidebar.selectbox(
+        "AI Model",
+        options=["gpt-4o-mini", "gpt-4o"],
+        index=0,
+        label_visibility="collapsed",
+        help="gpt-4o-mini works on all API tiers (including free). gpt-4o gives richer analysis but requires a paid account.",
+    )
+    st.session_state["openai_model"] = model_choice
+
     with st.sidebar.expander("Optional analyzers"):
         for label, available in optional_analyzer_status().items():
             st.write(f"{'Available' if available else 'Not installed'}: {label}")
@@ -263,7 +273,16 @@ def dashboard(report: dict, observations: dict) -> None:
     c.metric("Analysis Mode", report.get("analysis_mode", "Unknown"))
 
     if not modes.get("openai"):
-        st.info(report.get("ai_status", "OpenAI Vision was not used for this scan."))
+        ai_status = report.get("ai_status", "OpenAI Vision was not used for this scan.")
+        if "error" in ai_status.lower() or "401" in ai_status or "403" in ai_status:
+            st.error(f"AI analysis failed — {ai_status}")
+            st.caption(
+                "Common fixes: (1) Check the key starts with `sk-` and was copied in full. "
+                "(2) Switch to **gpt-4o-mini** in the sidebar — it works on free-tier keys. "
+                "(3) Verify the key at platform.openai.com → API Keys."
+            )
+        else:
+            st.info(ai_status)
     if modes.get("crewai"):
         st.caption("CrewAI dependency detected; agent role pipeline is available.")
     else:
